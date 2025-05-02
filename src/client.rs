@@ -261,10 +261,7 @@ impl<'a> AppSyncEventsClientBuilder<'a> {
 
     /// Set the IAM authentication provider
     pub fn with_iam_auth(mut self) -> Result<AppSyncEventsClient<'a>> {
-        self.auth_type = Some(AuthType::new_iam(
-            self.realtime_host.clone(),
-            self.config,
-        ));
+        self.auth_type = Some(AuthType::new_iam(self.realtime_host.clone(), self.config));
         self.build()
     }
 
@@ -319,13 +316,13 @@ async fn websocket_manager_loop(
     auth_type: AuthType<'_>,
     mut cmd_receiver: mpsc::Receiver<WebSocketCommand>,
     allow_no_subscriptions: bool,
-    initial_connection: ClientSocket,
+    initial_connection: Option<ClientSocket>,
     state: Arc<WebSocketState>,
 ) {
     // Jitter factor for exponential backoff
     const JITTER_FACTOR: u64 = 100;
 
-    let mut websocket: Option<ClientSocket> = Some(initial_connection);
+    let mut websocket: Option<ClientSocket> = initial_connection;
     let mut reconnect_attempts = 0;
 
     if websocket.is_some() {
@@ -381,11 +378,7 @@ async fn websocket_manager_loop(
                 }
                 // Most of these errors are not recoverable
                 Err(Error::WebSocket(e)) => match e {
-                    tokio_websockets::Error::AlreadyClosed => {
-                        state.set_connection_state(ConnectionState::Disrupted);
-                        continue;
-                    }
-                    tokio_websockets::Error::Io(_) => {
+                    tokio_websockets::Error::AlreadyClosed | tokio_websockets::Error::Io(_) => {
                         state.set_connection_state(ConnectionState::Disrupted);
                         continue;
                     }
@@ -864,7 +857,18 @@ impl AppSyncEventsClient<'_> {
         let allow_no_subscriptions = self.allow_no_subscriptions;
 
         let state = Arc::new(WebSocketState::new());
-        let initial_connection = connect_websocket(&ws_endpoint, &auth_type, state.clone()).await?;
+
+        let initial_connection_option =
+            match connect_websocket(&ws_endpoint, &auth_type, state.clone()).await {
+                Ok(ws) => Some(ws),
+                Err(Error::WebSocket(e)) => match e {
+                    // treat these as recoverable, let the loop handle connection
+                    tokio_websockets::Error::AlreadyClosed | tokio_websockets::Error::Io(_) => None,
+                    // other errors are unrecoverable during initial connect
+                    _ => return Err(Error::WebSocket(e)),
+                },
+                Err(_) => None,
+            };
 
         tokio::spawn(async move {
             websocket_manager_loop(
@@ -872,7 +876,7 @@ impl AppSyncEventsClient<'_> {
                 auth_type,
                 cmd_receiver,
                 allow_no_subscriptions,
-                initial_connection,
+                initial_connection_option,
                 state,
             )
             .await;
