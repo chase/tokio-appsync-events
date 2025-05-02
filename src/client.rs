@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2025 Chase Colman
+// SPDX-License-Identifier: MPL-2.0
+
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::str::FromStr;

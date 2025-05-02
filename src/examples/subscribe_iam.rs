@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2025 Chase Colman
+// SPDX-License-Identifier: MPL-2.0
+
 use aws_config::BehaviorVersion;
 use aws_config::SdkConfig;
 use futures_util::StreamExt;

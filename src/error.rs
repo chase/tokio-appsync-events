@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2025 Chase Colman
+// SPDX-License-Identifier: MPL-2.0
+
 use thiserror::Error;
 
 /// Error types for the AWS AppSync Events client

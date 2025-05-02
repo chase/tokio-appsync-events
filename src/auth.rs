@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2025 Chase Colman
+// SPDX-License-Identifier: MPL-2.0
+
 use aws_config::SdkConfig;
 use aws_credential_types::provider::ProvideCredentials;
 use aws_sigv4::http_request::{SignableRequest, sign};

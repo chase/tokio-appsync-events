@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2025 Chase Colman
+// SPDX-License-Identifier: MPL-2.0
+
 //! A Rust client for AWS AppSync Real-Time Events API
 //! 
 //! This library provides functionality to connect to AWS AppSync Events endpoints
