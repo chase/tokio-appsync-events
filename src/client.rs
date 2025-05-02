@@ -1,3 +1,4 @@
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -8,17 +9,16 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use aws_config::SdkConfig;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use dashmap::DashMap;
 use futures_util::sink::SinkExt;
 use futures_util::stream::Stream;
 use http::{HeaderName, HeaderValue, Uri};
-use serde::de::DeserializeOwned;
 use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
-use tokio_stream::adapters::FilterMap;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_websockets::{ClientBuilder, MaybeTlsStream, Message, WebSocketStream};
@@ -30,7 +30,7 @@ use crate::message::MessagePayload;
 use crate::message::{ConnectionPayload, SubscriptionMessage, SubscriptionPayload};
 
 /// Default WebSocket protocol for AppSync Events API
-const WS_PROTOCOL_NAME: &'static str = "aws-appsync-event-ws";
+const WS_PROTOCOL_NAME: &str = "aws-appsync-event-ws";
 
 const MINUTES: u64 = 60;
 
@@ -53,7 +53,8 @@ type ClientSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 pub struct Subscription<T: DeserializeOwned + Unpin> {
     id: String,
     unsub_sender: mpsc::Sender<String>,
-    event_receiver: FilterMap<ReceiverStream<String>, fn(String) -> Option<T>>,
+    receiver: ReceiverStream<String>,
+    _marker: PhantomData<T>,
 }
 
 impl<T: DeserializeOwned + Unpin> Subscription<T> {
@@ -66,9 +67,8 @@ impl<T: DeserializeOwned + Unpin> Subscription<T> {
         Self {
             id,
             unsub_sender,
-            event_receiver: ReceiverStream::new(event_receiver).filter_map(|payload| {
-                serde_json::from_str::<T>(&payload).ok()
-            }),
+            receiver: ReceiverStream::new(event_receiver),
+            _marker: PhantomData,
         }
     }
 
@@ -80,14 +80,14 @@ impl<T: DeserializeOwned + Unpin> Subscription<T> {
 
 impl<T: DeserializeOwned + Unpin> Drop for Subscription<T> {
     fn drop(&mut self) {
+        self.receiver.close();
+
         // When the subscription is dropped, send the unsubscribe message without blocking
         let id = self.id.clone();
         let unsub_sender = self.unsub_sender.clone();
 
         tokio::spawn(async move {
-            if let Err(err) = unsub_sender.send(id).await {
-                eprintln!("Failed to send unsubscribe message: {}", err);
-            }
+            let _ = unsub_sender.send(id).await;
         });
     }
 }
@@ -96,7 +96,20 @@ impl<T: DeserializeOwned + Unpin> Stream for Subscription<T> {
     type Item = T;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.event_receiver).poll_next(cx)
+        loop {
+            match core::task::ready!(Pin::new(&mut self.receiver).poll_next(cx)) {
+                Some(payload) => {
+                    if let Ok(item) = serde_json::from_str::<T>(&payload) {
+                        return Poll::Ready(Some(item));
+                    }
+                }
+                None => return Poll::Ready(None),
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, self.receiver.size_hint().1)
     }
 }
 
@@ -118,6 +131,9 @@ enum ConnectionState {
 
     /// Disconnected
     Disconnected,
+
+    /// Unrecoverable error
+    UnrecoverableError,
 }
 
 /// Command sent to the WebSocket manager
@@ -146,6 +162,7 @@ enum WebSocketCommand {
 struct SocketSubscription {
     channel: String,
     sender: mpsc::Sender<String>,
+    ack_sender: Option<oneshot::Sender<Result<()>>>,
 }
 
 /// Internal state of the WebSocket manager
@@ -241,16 +258,9 @@ impl<'a> AppSyncEventsClientBuilder<'a> {
     }
 
     /// Set the IAM authentication provider
-    pub async fn with_iam_auth(
-        mut self,
-    ) -> Result<AppSyncEventsClient<'a>> {
+    pub async fn with_iam_auth(mut self) -> Result<AppSyncEventsClient<'a>> {
         self.auth_type = Some(
-            AuthType::new_iam(
-                self.app_id.clone(),
-                self.region.to_string(),
-                self.config,
-            )
-            .await
+            AuthType::new_iam(self.app_id.clone(), self.region.to_string(), self.config).await,
         );
         self.build()
     }
@@ -263,7 +273,11 @@ impl<'a> AppSyncEventsClientBuilder<'a> {
 
     /// Set the API Key authentication provider
     pub fn with_api_key_auth(mut self, key: impl Into<String>) -> Result<AppSyncEventsClient<'a>> {
-        self.auth_type = Some(AuthType::ApiKey(key.into()));
+        self.auth_type = Some(AuthType::ApiKey {
+            app_id: self.app_id.clone(),
+            region: self.region.to_string(),
+            key: key.into(),
+        });
         self.build()
     }
 
@@ -298,18 +312,24 @@ pub struct AppSyncEventsClient<'a> {
 }
 
 /// WebSocket manager loop
-async fn websocket_manager_loop<'a>(
+async fn websocket_manager_loop(
     ws_endpoint: String,
-    auth_type: AuthType<'a>,
+    auth_type: AuthType<'_>,
     mut cmd_receiver: mpsc::Receiver<WebSocketCommand>,
     allow_no_subscriptions: bool,
+    initial_connection: ClientSocket,
+    state: Arc<WebSocketState>,
 ) {
     // Jitter factor for exponential backoff
     const JITTER_FACTOR: u64 = 100;
 
-    let state = Arc::new(WebSocketState::new());
-    let mut websocket: Option<ClientSocket> = None;
+    let mut websocket: Option<ClientSocket> = Some(initial_connection);
     let mut reconnect_attempts = 0;
+
+    if websocket.is_some() {
+        state.set_connection_state(ConnectionState::Connected);
+        state.update_keep_alive_timestamp();
+    }
 
     let keep_alive_state = state.clone();
 
@@ -343,24 +363,49 @@ async fn websocket_manager_loop<'a>(
             tokio::time::sleep(backoff).await;
             reconnect_attempts += 1;
 
-            if let Ok(ws) = connect_websocket(&ws_endpoint, &auth_type, state.clone()).await {
-                websocket = Some(ws);
-                reconnect_attempts = 0;
-
-                for subscription in state.subscriptions.iter() {
-                    let _ = send_subscribe(
-                        subscription.key().clone(),
-                        subscription.value().channel.clone(),
-                        websocket.as_mut().unwrap(),
-                        &auth_type,
-                    )
-                    .await;
+            match connect_websocket(&ws_endpoint, &auth_type, state.clone()).await {
+                Ok(ws) => {
+                    websocket = Some(ws);
+                    reconnect_attempts = 0;
+                    for subscription in state.subscriptions.iter() {
+                        let _ = send_subscribe(
+                            subscription.key().clone(),
+                            subscription.value().channel.clone(),
+                            websocket.as_mut().unwrap(),
+                            &auth_type,
+                        )
+                        .await;
+                    }
+                }
+                // Most of these errors are not recoverable
+                Err(Error::WebSocket(e)) => match e {
+                    tokio_websockets::Error::AlreadyClosed => {
+                        state.set_connection_state(ConnectionState::Disrupted);
+                        continue;
+                    }
+                    tokio_websockets::Error::Io(_) => {
+                        state.set_connection_state(ConnectionState::Disrupted);
+                        continue;
+                    }
+                    _ => {
+                        state.set_connection_state(ConnectionState::UnrecoverableError);
+                        return;
+                    }
+                },
+                Err(_) => {
+                    state.set_connection_state(ConnectionState::Disrupted);
+                    continue;
                 }
             }
         }
 
         // If there is no WebSocket and the connection is not disrupted, connect
-        if websocket.is_none() && !state.has_connection_state(ConnectionState::Disrupted) {
+        if websocket.is_none()
+            && !state.has_one_of_connection_states(&[
+                ConnectionState::Disrupted,
+                ConnectionState::UnrecoverableError,
+            ])
+        {
             state.set_connection_state(ConnectionState::Connecting);
 
             match connect_websocket(&ws_endpoint, &auth_type, state.clone()).await {
@@ -368,6 +413,15 @@ async fn websocket_manager_loop<'a>(
                     websocket = Some(ws);
                     reconnect_attempts = 0;
                 }
+                // Most of these errors are not recoverable
+                Err(Error::WebSocket(e)) => match e {
+                    tokio_websockets::Error::AlreadyClosed => continue,
+                    tokio_websockets::Error::Io(_) => continue,
+                    _ => {
+                        state.set_connection_state(ConnectionState::UnrecoverableError);
+                        return;
+                    }
+                },
                 Err(_) => {
                     state.set_connection_state(ConnectionState::Disrupted);
                     continue;
@@ -403,15 +457,28 @@ async fn websocket_manager_loop<'a>(
                         channel,
                         result_sender,
                     }) => {
-                        let result = handle_subscribe_command(
-                            id,
-                            channel,
-                            ws,
-                            &auth_type,
-                            state.clone(),
-                        )
-                        .await;
-                        let _ = result_sender.send(result);
+                        let (receiver, ack_receiver) =
+                            handle_subscribe_command(id, channel, ws, &auth_type, state.clone())
+                                .await;
+                        // the task handling websocket_manager_loop is the same as the one sending the
+                        // subscribe command and websocket_message_handler which receives the ack, so it needs
+                        // to be handled in a separate task to prevent blocking
+                        tokio::spawn(async move {
+                            match ack_receiver.await {
+                                Ok(Ok(())) => {
+                                    let _ = result_sender.send(Ok(receiver));
+                                }
+                                Ok(Err(e)) => {
+                                    let _ = result_sender.send(Err(e));
+                                }
+                                // ack_sender was dropped
+                                Err(_) => {
+                                    let _ = result_sender.send(Err(Error::Other(
+                                        "Subscription acknowledgment channel closed".to_string(),
+                                    )));
+                                }
+                            }
+                        });
                     }
                     Some(WebSocketCommand::Publish {
                         channel,
@@ -466,14 +533,15 @@ async fn websocket_manager_loop<'a>(
 }
 
 /// Connect to the AppSync WebSocket endpoint and perform handshake
-async fn connect_websocket<'a>(
+async fn connect_websocket(
     ws_endpoint: &str,
-    auth_type: &AuthType<'a>,
+    auth_type: &AuthType<'_>,
     state: Arc<WebSocketState>,
 ) -> Result<ClientSocket> {
     // Empty payload on connect
-    let payload = "{}";
-    let connection_init = "{\"type\":\"connection_init\"}";
+    let payload: &'static str = "{}";
+    let connection_init: &'static str = "{\"type\":\"connection_init\"}";
+    let header_name = HeaderName::from_static("sec-websocket-protocol");
 
     let auth_headers = auth_type.get_auth_headers(payload).await?;
 
@@ -489,7 +557,7 @@ async fn connect_websocket<'a>(
             .map_err(|e| Error::Other(format!("Failed to parse endpoint: {}", e)))?,
     )
     .add_header(
-        HeaderName::from_static("Sec-WebSocket-Protocol"),
+        header_name,
         HeaderValue::from_str(&header_value_str)
             .map_err(|e| Error::Other(format!("Failed to add protocol header: {}", e)))?,
     )?
@@ -548,11 +616,11 @@ async fn wait_for_connection_ack(client: &mut ClientSocket) -> Result<Duration> 
                 connection_timeout_ms,
             } => {
                 return Ok(connection_timeout_ms
-                    .map_or(DEFAULT_KEEP_ALIVE_TIMEOUT, |ms| Duration::from_millis(ms)));
+                    .map_or(DEFAULT_KEEP_ALIVE_TIMEOUT, Duration::from_millis));
             }
             ConnectionPayload::Error { errors } => {
                 if let Some(errors) = errors {
-                    return Err(Error::HandshakeError(errors[0].error_type.clone()));
+                    return Err(Error::HandshakeError(errors[0].message.clone()));
                 }
                 return Err(Error::HandshakeError("unknown".to_string()));
             }
@@ -583,25 +651,33 @@ async fn handle_websocket_message(message: Message, state: Arc<WebSocketState>) 
         MessagePayload::Data { id, payload } => {
             state.update_keep_alive_timestamp();
 
-            if id.is_empty() {
-                return;
-            }
             if let Some(subscription) = state.subscriptions.get(&id) {
                 let _ = subscription.sender.try_send(payload);
             }
         }
+        MessagePayload::SubscribeAck { id } => {
+            if let Some(mut subscription) = state.subscriptions.get_mut(&id) {
+                if let Some(ack_sender) = subscription.ack_sender.take() {
+                    let _ = ack_sender.send(Ok(()));
+                }
+            }
+        }
         MessagePayload::Error { id } => {
-            state.subscriptions.remove(&id);
+            if let Some((_, mut subscription)) = state.subscriptions.remove(&id) {
+                if let Some(ack_sender) = subscription.ack_sender.take() {
+                    let _ = ack_sender.send(Err(Error::Other("Failed to subscribe".to_string())));
+                }
+            }
         }
         _ => {}
     }
 }
 
-async fn send_subscribe<'a>(
+async fn send_subscribe(
     id: String,
     channel: String,
     client: &mut ClientSocket,
-    auth_type: &AuthType<'a>,
+    auth_type: &AuthType<'_>,
 ) -> Result<()> {
     let serialized_data = json!({
         "channel": &channel,
@@ -631,37 +707,38 @@ async fn send_subscribe<'a>(
     Ok(())
 }
 
-async fn handle_subscribe_command<'a>(
+async fn handle_subscribe_command(
     id: String,
     channel: String,
     client: &mut ClientSocket,
-    auth_type: &AuthType<'a>,
+    auth_type: &AuthType<'_>,
     state: Arc<WebSocketState>,
-) -> Result<mpsc::Receiver<String>> {
+) -> (mpsc::Receiver<String>, oneshot::Receiver<Result<()>>) {
     let (sender, receiver) = mpsc::channel(32);
+    let (ack_sender, ack_receiver) = oneshot::channel();
     state.subscriptions.insert(
         id.clone(),
         SocketSubscription {
             channel: channel.clone(),
             sender,
+            ack_sender: Some(ack_sender),
         },
     );
 
-    send_subscribe(id, channel, client, auth_type).await?;
-
-    Ok(receiver)
+    let _ = send_subscribe(id, channel, client, auth_type).await;
+    (receiver, ack_receiver)
 }
 
-async fn handle_publish_command<'a>(
+async fn handle_publish_command(
     channel: String,
     event: String,
     client: &mut ClientSocket,
-    auth_type: &AuthType<'a>,
+    auth_type: &AuthType<'_>,
 ) -> Result<()> {
     let id = Uuid::new_v4().to_string();
 
     // event API expects an array of JSON strings
-    let events = [json!(&event).to_string()];
+    let events = [event];
 
     let serialized_data = json!({
         "channel": &channel,
@@ -711,7 +788,7 @@ async fn handle_unsubscribe_command(
     Ok(())
 }
 
-impl<'a> AppSyncEventsClient<'a> {
+impl AppSyncEventsClient<'_> {
     /// Initialize the client, starting the WebSocket manager
     pub async fn connect(&mut self) -> Result<()>
     where
@@ -728,19 +805,26 @@ impl<'a> AppSyncEventsClient<'a> {
         let auth_type = self.auth_type.clone();
         let allow_no_subscriptions = self.allow_no_subscriptions;
 
+        let state = Arc::new(WebSocketState::new());
+        let initial_connection = connect_websocket(&ws_endpoint, &auth_type, state.clone()).await?;
+
         tokio::spawn(async move {
-            websocket_manager_loop(ws_endpoint, auth_type, cmd_receiver, allow_no_subscriptions)
-                .await;
+            websocket_manager_loop(
+                ws_endpoint,
+                auth_type,
+                cmd_receiver,
+                allow_no_subscriptions,
+                initial_connection,
+                state,
+            )
+            .await;
         });
 
         Ok(())
     }
 
     /// Subscribe to an event channel
-    pub async fn subscribe<T>(
-        &self,
-        channel: impl Into<String>,
-    ) -> Result<Subscription<T>>
+    pub async fn subscribe<T>(&self, channel: impl Into<String>) -> Result<Subscription<T>>
     where
         T: DeserializeOwned + Unpin,
     {
@@ -783,11 +867,7 @@ impl<'a> AppSyncEventsClient<'a> {
     }
 
     /// Publish to an event channel
-    pub async fn publish<T>(
-        &self,
-        channel: impl Into<String>,
-        event: T,
-    ) -> Result<()>
+    pub async fn publish<T>(&self, channel: impl Into<String>, event: T) -> Result<()>
     where
         T: Serialize,
     {

@@ -4,7 +4,6 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
 use tokio::sync::OnceCell;
-use tokio::time::Duration;
 
 use tokio_appsync_events::AppSyncEventsClientBuilder;
 
@@ -32,6 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let aws_config = get_aws_config().await;
     let appsync_app_id = "your-appsync-app-id";
     let api_key = "your-api-key";
+    let channel = "default/test-channel";
 
     // Create the client using the new builder
     let mut client = AppSyncEventsClientBuilder::new(appsync_app_id, aws_config)
@@ -40,44 +40,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Connect the client (replaces initialize)
     client.connect().await?;
 
-    println!("Subscribing to channel 'test-channel'...");
+    println!("Subscribing to channel '{}'...", channel);
 
     // Subscribe to an event channel, specifying the expected data type
     let mut subscription = client
-        .subscribe::<MyEventData>("test-channel")
+        .subscribe::<MyEventData>(channel)
         .await?;
 
     println!("Subscribed with ID: {}", subscription.id());
 
     // Spawn a task to handle events by iterating the subscription stream
     let event_task = tokio::spawn(async move {
-        while let Some(event_data) = subscription.next().await {
-            println!("Received event data: {:?}", event_data);
-            // No manual parsing needed here, the stream handles deserialization
-        }
-        println!("Subscription stream ended.");
+        let Some(event_data) = subscription.next().await else {
+            println!("Subscription stream ended.");
+            return;
+        };
+        println!("Received event data: {:?}", event_data);
     });
 
-    // Give some time for the subscription to establish before publishing
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
     // Publish to the same channel
-    println!("Publishing to channel 'test-channel'...");
+    println!("Publishing to channel '{}'...", channel);
     let payload = MyEventData {
         message: "Hello from publisher!".to_string(),
     };
-    client.publish("test-channel", payload).await?;
-
-    // Wait for a moment to receive events
-    tokio::time::sleep(Duration::from_secs(10)).await;
-
-    // Close the client
-    client.close().await?;
-
-    println!("Client closed");
+    client.publish(channel, payload).await?;
 
     // Wait for the event handling task to finish
     let _ = event_task.await;
+
+    // Close the client
+    client.close().await?;
+    println!("Client closed");
 
     Ok(())
 } 

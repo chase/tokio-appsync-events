@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::error::{Error, Result};
+use crate::url::events_host;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct LambdaToken(String);
@@ -23,7 +24,11 @@ pub enum AuthType<'a> {
     /// Lambda authentication
     Lambda(LambdaToken),
     /// API Key authentication
-    ApiKey(String),
+    ApiKey {
+        app_id: String,
+        region: String,
+        key: String,
+    },
 }
 
 impl<'a> AuthType<'a> {
@@ -103,8 +108,9 @@ impl<'a> AuthType<'a> {
 
                 Ok(headers)
             }
-            Self::ApiKey(key) => {
+            Self::ApiKey { app_id, region, key } => {
                 let mut headers = HashMap::new();
+                headers.insert("host".to_string(), events_host(app_id, region));
                 headers.insert("x-api-key".to_string(), key.clone());
                 Ok(headers)
             }
@@ -113,7 +119,7 @@ impl<'a> AuthType<'a> {
 }
 
 // We only care about variants, not value equality
-impl<'a> PartialEq for AuthType<'a> {
+impl PartialEq for AuthType<'_> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (AuthType::Iam { .. }, AuthType::Iam { .. }) => true,

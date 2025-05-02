@@ -48,8 +48,7 @@ pub struct Extensions {
 
 #[derive(Deserialize)]
 pub struct HandshakeError {
-    #[serde(rename = "errorType")]
-    pub error_type: String,
+    pub message: String,
 }
 
 #[derive(Deserialize)]
