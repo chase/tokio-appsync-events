@@ -178,6 +178,9 @@ struct WebSocketState {
 
     /// Subscriptions
     subscriptions: DashMap<String, SocketSubscription>,
+
+    /// Publish acks
+    publish_acks: DashMap<String, oneshot::Sender<Result<()>>>,
 }
 
 impl WebSocketState {
@@ -188,6 +191,7 @@ impl WebSocketState {
             keep_alive_timestamp: RwLock::new(Instant::now()),
             keep_alive_timeout: RwLock::new(DEFAULT_KEEP_ALIVE_TIMEOUT),
             subscriptions: DashMap::new(),
+            publish_acks: DashMap::new(),
         }
     }
 
@@ -232,14 +236,11 @@ impl WebSocketState {
 
 /// Builder for the AppSync Events client
 pub struct AppSyncEventsClientBuilder<'a> {
-    /// AppSync app ID
-    app_id: String,
+    /// AppSync realtime host
+    realtime_host: String,
 
     /// AWS SDK config
     config: &'a SdkConfig,
-
-    /// Region
-    region: &'a str,
 
     /// Authentication type
     auth_type: Option<AuthType<'a>>,
@@ -247,21 +248,20 @@ pub struct AppSyncEventsClientBuilder<'a> {
 
 impl<'a> AppSyncEventsClientBuilder<'a> {
     /// Create a new builder with the given endpoint and region
-    pub fn new(app_id: impl Into<String>, config: &'a SdkConfig) -> Self {
-        let region = config.region().map_or("us-east-1", |r| r.as_ref());
+    pub fn new(realtime_host: impl Into<String>, config: &'a SdkConfig) -> Self {
         Self {
-            app_id: app_id.into(),
+            realtime_host: realtime_host.into(),
             config,
             auth_type: None,
-            region,
         }
     }
 
     /// Set the IAM authentication provider
-    pub async fn with_iam_auth(mut self) -> Result<AppSyncEventsClient<'a>> {
-        self.auth_type = Some(
-            AuthType::new_iam(self.app_id.clone(), self.region.to_string(), self.config).await,
-        );
+    pub fn with_iam_auth(mut self) -> Result<AppSyncEventsClient<'a>> {
+        self.auth_type = Some(AuthType::new_iam(
+            self.realtime_host.clone(),
+            self.config,
+        ));
         self.build()
     }
 
@@ -274,8 +274,7 @@ impl<'a> AppSyncEventsClientBuilder<'a> {
     /// Set the API Key authentication provider
     pub fn with_api_key_auth(mut self, key: impl Into<String>) -> Result<AppSyncEventsClient<'a>> {
         self.auth_type = Some(AuthType::ApiKey {
-            app_id: self.app_id.clone(),
-            region: self.region.to_string(),
+            realtime_host: self.realtime_host.clone(),
             key: key.into(),
         });
         self.build()
@@ -288,7 +287,7 @@ impl<'a> AppSyncEventsClientBuilder<'a> {
         })?;
 
         Ok(AppSyncEventsClient {
-            realtime_endpoint: crate::url::events_realtime(self.app_id.as_str(), self.region),
+            realtime_endpoint: crate::url::events_realtime(&self.realtime_host),
             auth_type,
             cmd_sender: None,
             allow_no_subscriptions: true,
@@ -485,8 +484,25 @@ async fn websocket_manager_loop(
                         event,
                         result_sender,
                     }) => {
-                        let result = handle_publish_command(channel, event, ws, &auth_type).await;
-                        let _ = result_sender.send(result);
+                        let ack_receiver =
+                            handle_publish_command(channel, event, ws, &auth_type, state.clone())
+                                .await;
+                        tokio::spawn(async move {
+                            match ack_receiver.await {
+                                Ok(Ok(())) => {
+                                    let _ = result_sender.send(Ok(()));
+                                }
+                                Ok(Err(e)) => {
+                                    let _ = result_sender.send(Err(e));
+                                }
+                                // ack_sender was dropped
+                                Err(_) => {
+                                    let _ = result_sender.send(Err(Error::Other(
+                                        "Subscription acknowledgment channel closed".to_string(),
+                                    )));
+                                }
+                            }
+                        });
                     }
                     Some(WebSocketCommand::Unsubscribe { id }) => {
                         let _ = handle_unsubscribe_command(id, ws, state.clone()).await;
@@ -615,14 +631,24 @@ async fn wait_for_connection_ack(client: &mut ClientSocket) -> Result<Duration> 
             ConnectionPayload::Ack {
                 connection_timeout_ms,
             } => {
-                return Ok(connection_timeout_ms
-                    .map_or(DEFAULT_KEEP_ALIVE_TIMEOUT, Duration::from_millis));
+                return Ok(
+                    connection_timeout_ms.map_or(DEFAULT_KEEP_ALIVE_TIMEOUT, Duration::from_millis)
+                );
             }
             ConnectionPayload::Error { errors } => {
-                if let Some(errors) = errors {
-                    return Err(Error::HandshakeError(errors[0].message.clone()));
+                if let Some(error) = errors.first() {
+                    if let Some(error_type) = &error.error_type {
+                        if error_type == "UnauthorizedException" {
+                            return Err(Error::Unauthorized);
+                        } else {
+                            return Err(Error::HandshakeError(error_type.clone()));
+                        }
+                    } else if let Some(message) = &error.message {
+                        return Err(Error::HandshakeError(message.clone()));
+                    }
                 }
-                return Err(Error::HandshakeError("unknown".to_string()));
+                // Default error if no specific message or type is found
+                return Err(Error::HandshakeError("Unknown handshake error".to_string()));
             }
         }
     }
@@ -662,6 +688,20 @@ async fn handle_websocket_message(message: Message, state: Arc<WebSocketState>) 
                 }
             }
         }
+        MessagePayload::PublishAck { id } => {
+            if let Some((_, ack_sender)) = state.publish_acks.remove(&id) {
+                let _ = ack_sender.send(Ok(()));
+            }
+        }
+        MessagePayload::PublishError { id, errors } => {
+            if let Some((_, ack_sender)) = state.publish_acks.remove(&id) {
+                if errors[0].error_type == "UnauthorizedException" {
+                    let _ = ack_sender.send(Err(Error::Unauthorized));
+                } else {
+                    let _ = ack_sender.send(Err(Error::Other(errors[0].error_type.clone())));
+                }
+            }
+        }
         MessagePayload::Error { id } => {
             if let Some((_, mut subscription)) = state.subscriptions.remove(&id) {
                 if let Some(ack_sender) = subscription.ack_sender.take() {
@@ -669,8 +709,43 @@ async fn handle_websocket_message(message: Message, state: Arc<WebSocketState>) 
                 }
             }
         }
-        _ => {}
     }
+}
+
+async fn send_publish(
+    id: String,
+    channel: String,
+    events: [String; 1],
+    client: &mut ClientSocket,
+    auth_type: &AuthType<'_>,
+) -> Result<()> {
+    let serialized_data = json!({
+        "channel": &channel,
+        "events": &events
+    })
+    .to_string();
+
+    let auth_headers = auth_type.get_auth_headers(&serialized_data).await?;
+
+    let publish_msg = SubscriptionMessage {
+        message_type: "publish",
+        id,
+        channel: channel.clone(),
+        events: Some(events.clone()),
+        authorization: auth_headers.clone(),
+        payload: SubscriptionPayload {
+            channel,
+            events: Some(events),
+            extensions: crate::message::Extensions {
+                authorization: auth_headers,
+            },
+        },
+    };
+
+    let publish_msg_json = serde_json::to_string(&publish_msg)?;
+    client.send(Message::text(publish_msg_json)).await?;
+
+    Ok(())
 }
 
 async fn send_subscribe(
@@ -725,6 +800,7 @@ async fn handle_subscribe_command(
         },
     );
 
+    // TODO: handle error
     let _ = send_subscribe(id, channel, client, auth_type).await;
     (receiver, ack_receiver)
 }
@@ -734,39 +810,18 @@ async fn handle_publish_command(
     event: String,
     client: &mut ClientSocket,
     auth_type: &AuthType<'_>,
-) -> Result<()> {
+    state: Arc<WebSocketState>,
+) -> oneshot::Receiver<Result<()>> {
     let id = Uuid::new_v4().to_string();
 
-    // event API expects an array of JSON strings
     let events = [event];
+    let (publish_ack_sender, publish_ack_receiver) = oneshot::channel();
+    state.publish_acks.insert(id.clone(), publish_ack_sender);
 
-    let serialized_data = json!({
-        "channel": &channel,
-        "events": &events
-    })
-    .to_string();
+    // TODO: handle error
+    let _ = send_publish(id, channel, events, client, auth_type).await;
 
-    let auth_headers = auth_type.get_auth_headers(&serialized_data).await?;
-
-    let publish_msg = SubscriptionMessage {
-        message_type: "publish",
-        id,
-        channel: channel.clone(),
-        events: Some(events.clone()),
-        authorization: auth_headers.clone(),
-        payload: SubscriptionPayload {
-            channel,
-            events: Some(events),
-            extensions: crate::message::Extensions {
-                authorization: auth_headers,
-            },
-        },
-    };
-
-    let publish_msg_json = serde_json::to_string(&publish_msg)?;
-    client.send(Message::text(publish_msg_json)).await?;
-
-    Ok(())
+    publish_ack_receiver
 }
 
 async fn handle_unsubscribe_command(

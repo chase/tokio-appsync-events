@@ -32,3 +32,7 @@ tokio-stream = "0.1.17"
 [[example]]
 name = "simple"
 path = "src/examples/simple.rs"
+
+[[example]]
+name = "subscribe_iam"
+path = "src/examples/subscribe_iam.rs"

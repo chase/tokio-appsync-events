@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use crate::error::{Error, Result};
-use crate::url::events_host;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct LambdaToken(String);
@@ -17,25 +16,22 @@ pub struct LambdaToken(String);
 pub enum AuthType<'a> {
     /// IAM authentication
     Iam {
-        app_id: String,
-        region: String,
+        realtime_host: String,
         config: &'a SdkConfig,
     },
     /// Lambda authentication
     Lambda(LambdaToken),
     /// API Key authentication
     ApiKey {
-        app_id: String,
-        region: String,
+        realtime_host: String,
         key: String,
     },
 }
 
 impl<'a> AuthType<'a> {
-    pub async fn new_iam(app_id: String, region: String, config: &'a SdkConfig) -> Self {
+    pub fn new_iam(realtime_host: String, config: &'a SdkConfig) -> Self {
         Self::Iam {
-            app_id,
-            region,
+            realtime_host,
             config,
         }
     }
@@ -47,10 +43,10 @@ impl<'a> AuthType<'a> {
     pub async fn get_auth_headers(&self, payload: &str) -> Result<HashMap<String, String>> {
         match self {
             Self::Iam {
-                app_id,
-                region,
+                realtime_host,
                 config,
             } => {
+                let region = config.region().map_or("us-east-1", |r| r.as_ref());
                 let credentials = config
                     .credentials_provider()
                     .ok_or(Error::Authentication(
@@ -61,18 +57,20 @@ impl<'a> AuthType<'a> {
                     .map_err(|e| Error::Authentication(e.to_string()))?;
 
                 let identity = Arc::new(credentials.into());
+                let host = crate::url::events_host(realtime_host);
+                // https://github.com/aws-amplify/amplify-js/blob/3c4d29e37797e6bec73db534278ed5ffd3c5d7e5/packages/api-graphql/src/Providers/AWSWebSocketProvider/authHeaders.ts#L43-L78
+                let headers = [
+                    ("host", host.as_str()),
+                    ("accept", "application/json, text/javascript"),
+                    ("content-encoding", "amz-1.0"),
+                    ("content-type", "application/json; charset=UTF-8"),
+                ];
                 // Reference:
                 // https://github.com/aws-amplify/amplify-js/blob/3c4d29e37797e6bec73db534278ed5ffd3c5d7e5/packages/api-graphql/src/Providers/AWSWebSocketProvider/authHeaders.ts#L43-L78
                 let signable_request = SignableRequest::new(
                     "POST",
-                    crate::url::events(app_id, region),
-                    // https://github.com/aws-amplify/amplify-js/blob/3c4d29e37797e6bec73db534278ed5ffd3c5d7e5/packages/api-graphql/src/Providers/AWSWebSocketProvider/authHeaders.ts#L43-L78
-                    [
-                        ("accept", "application/json, text/javascript"),
-                        ("content-encoding", "amz-1.0"),
-                        ("content-type", "application/json; charset=UTF-8"),
-                    ]
-                    .into_iter(),
+                    crate::url::events(realtime_host),
+                    headers.into_iter(),
                     aws_sigv4::http_request::SignableBody::Bytes(payload.as_bytes()),
                 )
                 .map_err(|e| {
@@ -99,6 +97,9 @@ impl<'a> AuthType<'a> {
                 for (name, value) in signing_result.output().headers() {
                     result_headers.insert(name.to_string(), value.to_string());
                 }
+                for (name, value) in headers {
+                    result_headers.insert(name.to_string(), value.to_string());
+                }
 
                 Ok(result_headers)
             }
@@ -108,9 +109,9 @@ impl<'a> AuthType<'a> {
 
                 Ok(headers)
             }
-            Self::ApiKey { app_id, region, key } => {
+            Self::ApiKey { realtime_host, key } => {
                 let mut headers = HashMap::new();
-                headers.insert("host".to_string(), events_host(app_id, region));
+                headers.insert("host".to_string(), crate::url::events_host(realtime_host));
                 headers.insert("x-api-key".to_string(), key.clone());
                 Ok(headers)
             }

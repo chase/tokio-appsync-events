@@ -46,6 +46,10 @@ pub enum Error {
     /// Non-retryable error
     #[error("Non-retryable error: {0}")]
     NonRetryable(String),
+
+    /// Unauthorized error
+    #[error("Unauthorized error")]
+    Unauthorized,
     
     /// Generic error
     #[error("{0}")]

@@ -1,11 +1,11 @@
-pub fn events(app_id: &str, region: &str) -> String {
-    format!("https://{}/event", events_host(app_id, region))
+pub fn events(realtime_host: &str) -> String {
+    format!("https://{}/event", events_host(realtime_host))
 }
 
-pub fn events_host(app_id: &str, region: &str) -> String {
-    format!("{}.appsync-api.{}.amazonaws.com", app_id, region)
+pub fn events_realtime(realtime_host: &str) -> String {
+    format!("wss://{}/event/realtime", realtime_host)
 }
 
-pub fn events_realtime(app_id: &str, region: &str) -> String {
-    format!("wss://{}.appsync-realtime-api.{}.amazonaws.com/event/realtime", app_id, region)
+pub fn events_host(realtime_host: &str) -> String {
+    realtime_host.replace("appsync-realtime-api", "appsync-api")
 }

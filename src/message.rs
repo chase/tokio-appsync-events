@@ -48,7 +48,16 @@ pub struct Extensions {
 
 #[derive(Deserialize)]
 pub struct HandshakeError {
-    pub message: String,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(rename = "errorType")]
+    pub error_type: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct PublishError {
+    #[serde(rename = "errorType")]
+    pub error_type: String,
 }
 
 #[derive(Deserialize)]
@@ -64,7 +73,7 @@ pub enum ConnectionPayload {
     /// Connection error
     #[serde(rename = "connection_error")]
     Error {
-        errors: Option<[HandshakeError; 1]>,
+        errors: Vec<HandshakeError>,
     },
 }
 
@@ -88,6 +97,15 @@ pub enum MessagePayload {
     PublishAck {
         /// Publish ID
         id: String,
+    },
+
+    /// Publish error
+    #[serde(rename = "publish_error")]
+    PublishError {
+        /// Publish ID
+        id: String,
+
+        errors: [PublishError; 1],
     },
 
     /// Error
