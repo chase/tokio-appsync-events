@@ -247,6 +247,9 @@ pub struct AppSyncEventsClientBuilder<'a> {
 
     /// Authentication type
     auth_type: Option<AuthType<'a>>,
+
+    /// Optional custom WebSocket endpoint URL
+    endpoint_url: Option<String>,
 }
 
 impl<'a> AppSyncEventsClientBuilder<'a> {
@@ -256,7 +259,14 @@ impl<'a> AppSyncEventsClientBuilder<'a> {
             realtime_host: realtime_host.into(),
             config,
             auth_type: None,
+            endpoint_url: None,
         }
+    }
+
+    /// Set a custom WebSocket endpoint URL
+    pub fn with_endpoint_url(mut self, url: impl Into<String>) -> Self {
+        self.endpoint_url = Some(url.into());
+        self
     }
 
     /// Set the IAM authentication provider
@@ -286,8 +296,12 @@ impl<'a> AppSyncEventsClientBuilder<'a> {
             Error::Authentication("Authentication provider is required".to_string())
         })?;
 
+        let endpoint_url = self
+            .endpoint_url
+            .unwrap_or_else(|| crate::url::events_realtime(&self.realtime_host));
+
         Ok(AppSyncEventsClient {
-            realtime_endpoint: crate::url::events_realtime(&self.realtime_host),
+            endpoint_url,
             auth_type,
             cmd_sender: None,
             allow_no_subscriptions: true,
@@ -298,7 +312,7 @@ impl<'a> AppSyncEventsClientBuilder<'a> {
 /// Client for AWS AppSync Real-Time Events
 pub struct AppSyncEventsClient<'a> {
     /// Realtime endpoint
-    realtime_endpoint: String,
+    endpoint_url: String,
 
     /// Authentication provider
     auth_type: AuthType<'a>,
@@ -312,7 +326,7 @@ pub struct AppSyncEventsClient<'a> {
 
 /// WebSocket manager loop
 async fn websocket_manager_loop(
-    ws_endpoint: String,
+    endpoint_url: String,
     auth_type: AuthType<'_>,
     mut cmd_receiver: mpsc::Receiver<WebSocketCommand>,
     allow_no_subscriptions: bool,
@@ -352,17 +366,21 @@ async fn websocket_manager_loop(
 
             state.set_connection_state(ConnectionState::Disconnected);
 
+            // Calculate exponential backoff delay in milliseconds, preventing overflow
+            let exponent = std::cmp::min(reconnect_attempts, 63) as u32;
+            let base_delay_ms = (1u64).checked_shl(exponent).unwrap_or(u64::MAX);
+            let delay_ms = base_delay_ms.saturating_mul(100);
+            let total_delay_ms = delay_ms.saturating_add(rand::random_range(0..JITTER_FACTOR));
+
             let backoff = std::cmp::min(
-                Duration::from_millis(
-                    100 * (1 << reconnect_attempts) + rand::random_range(0..JITTER_FACTOR),
-                ),
+                Duration::from_millis(total_delay_ms),
                 MAX_DELAY,
             );
 
             tokio::time::sleep(backoff).await;
             reconnect_attempts += 1;
 
-            match connect_websocket(&ws_endpoint, &auth_type, state.clone()).await {
+            match connect_websocket(&endpoint_url, &auth_type, state.clone()).await {
                 Ok(ws) => {
                     websocket = Some(ws);
                     reconnect_attempts = 0;
@@ -403,7 +421,7 @@ async fn websocket_manager_loop(
         {
             state.set_connection_state(ConnectionState::Connecting);
 
-            match connect_websocket(&ws_endpoint, &auth_type, state.clone()).await {
+            match connect_websocket(&endpoint_url, &auth_type, state.clone()).await {
                 Ok(ws) => {
                     websocket = Some(ws);
                     reconnect_attempts = 0;
@@ -546,7 +564,7 @@ async fn websocket_manager_loop(
 
 /// Connect to the AppSync WebSocket endpoint and perform handshake
 async fn connect_websocket(
-    ws_endpoint: &str,
+    endpoint_url: &str,
     auth_type: &AuthType<'_>,
     state: Arc<WebSocketState>,
 ) -> Result<ClientSocket> {
@@ -565,7 +583,7 @@ async fn connect_websocket(
     let header_value_str = format!("{}, {}", WS_PROTOCOL_NAME, auth_protocol);
 
     let (mut ws_stream, _response) = ClientBuilder::from_uri(
-        Uri::from_str(ws_endpoint)
+        Uri::from_str(endpoint_url)
             .map_err(|e| Error::Other(format!("Failed to parse endpoint: {}", e)))?,
     )
     .add_header(
@@ -852,14 +870,14 @@ impl AppSyncEventsClient<'_> {
         let (cmd_sender, cmd_receiver) = mpsc::channel::<WebSocketCommand>(32);
         self.cmd_sender = Some(cmd_sender);
 
-        let ws_endpoint = self.realtime_endpoint.clone();
+        let endpoint_url = self.endpoint_url.clone();
         let auth_type = self.auth_type.clone();
         let allow_no_subscriptions = self.allow_no_subscriptions;
 
         let state = Arc::new(WebSocketState::new());
 
         let initial_connection_option =
-            match connect_websocket(&ws_endpoint, &auth_type, state.clone()).await {
+            match connect_websocket(&endpoint_url, &auth_type, state.clone()).await {
                 Ok(ws) => Some(ws),
                 Err(Error::WebSocket(e)) => match e {
                     // treat these as recoverable, let the loop handle connection
@@ -872,7 +890,7 @@ impl AppSyncEventsClient<'_> {
 
         tokio::spawn(async move {
             websocket_manager_loop(
-                ws_endpoint,
+                endpoint_url,
                 auth_type,
                 cmd_receiver,
                 allow_no_subscriptions,

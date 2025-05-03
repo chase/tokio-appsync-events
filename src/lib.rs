@@ -10,7 +10,7 @@
 
 mod auth;
 mod error;
-mod message;
+pub(crate) mod message;
 mod client;
 mod url;
 

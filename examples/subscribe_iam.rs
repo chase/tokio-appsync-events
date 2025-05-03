@@ -31,28 +31,23 @@ async fn get_aws_config() -> &'static SdkConfig {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     const APPSYNC_REALTIME_HOST: &str = "**************************.appsync-realtime-api.us-east-1.amazonaws.com";
-    const API_KEY: &str = "da2-**************************";
     const CHANNEL: &str = "default/test-channel";
-    // Get static AWS SDK Config
+
     let aws_config = get_aws_config().await;
 
-    // Create the client using the new builder
     let mut client = AppSyncEventsClientBuilder::new(APPSYNC_REALTIME_HOST, aws_config)
-        .with_api_key_auth(API_KEY)?;
+        .with_iam_auth()?;
 
-    // Connect the client (replaces initialize)
     client.connect().await?;
 
     println!("Subscribing to channel '{}'...", CHANNEL);
 
-    // Subscribe to an event channel, specifying the expected data type
     let mut subscription = client
         .subscribe::<MyEventData>(CHANNEL)
         .await?;
 
     println!("Subscribed with ID: {}", subscription.id());
 
-    // Spawn a task to handle events by iterating the subscription stream
     let event_task = tokio::spawn(async move {
         let Some(event_data) = subscription.next().await else {
             println!("Subscription stream ended.");
@@ -61,17 +56,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Received event data: {:?}", event_data);
     });
 
-    // Publish to the same channel
-    println!("Publishing to channel '{}'...", CHANNEL);
-    let payload = MyEventData {
-        message: "Hello from publisher!".to_string(),
-    };
-    client.publish(CHANNEL, payload).await?;
-
-    // Wait for the event handling task to finish
     let _ = event_task.await;
 
-    // Close the client
     client.close().await?;
     println!("Client closed");
 
