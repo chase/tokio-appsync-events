@@ -4,7 +4,8 @@
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
-    sync::{Arc, atomic::{AtomicBool, Ordering}},
+    process,
+    sync::{atomic::{AtomicBool, Ordering}, Arc},
     time::Duration,
 };
 
@@ -128,7 +129,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Starting mock AppSync server...");
 
     let args = Args::parse();
-    let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
+    let in_docker = std::env::var("IN_DOCKER").map_or(false, |v| v == "true");
+    let ip_addr = if in_docker {
+        [0, 0, 0, 0]
+    } else {
+        [127, 0, 0, 1]
+    };
+    let addr = SocketAddr::from((ip_addr, args.port));
     let listener = TcpListener::bind(&addr).await?;
     info!(address = %addr, "Listening on address");
 
@@ -138,6 +145,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_stop_timer(&args, running.clone());
 
     info!("Starting main accept loop...");
+
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.unwrap();
+        info!("Received Ctrl+C, shutting down...");
+        process::exit(0);
+    });
 
     while let Ok((stream, peer_addr)) = listener.accept().await {
         handle_single_accept(stream, peer_addr, &args, server_state.clone()).await;
@@ -175,7 +188,8 @@ async fn handle_single_accept(
     tokio::spawn(async move {
         let conn_id = Uuid::new_v4();
         debug!(connection_id = %conn_id, "Task spawned. Calling handle_connection.");
-        if let Err(e) = handle_connection(stream, disconnect_after, state_clone_for_handler, conn_id).await
+        if let Err(e) =
+            handle_connection(stream, disconnect_after, state_clone_for_handler, conn_id).await
         {
             error!(connection_id = %conn_id, error = %e, "Connection handler error");
         } else {
@@ -375,11 +389,17 @@ async fn process_incoming_message(
                         return Ok(());
                     }
 
-                    state.add_subscription(sub_id.clone(), parsed_msg.channel.clone(), conn_tx.clone());
+                    state.add_subscription(
+                        sub_id.clone(),
+                        parsed_msg.channel.clone(),
+                        conn_tx.clone(),
+                    );
                     local_subscription_ids.insert(sub_id.clone());
 
                     let ack = json!({"type": "subscribe_success", "id": sub_id});
-                    ws_stream.send(Message::text(serde_json::to_string(&ack)?)).await
+                    ws_stream
+                        .send(Message::text(serde_json::to_string(&ack)?))
+                        .await
                         .map_err(|e| ProcessError::Fatal(Box::new(e)))?; // Send error is fatal
                     info!(sub_id = %sub_id, "Sent subscribe_success");
                     Ok(())
@@ -387,15 +407,17 @@ async fn process_incoming_message(
                 "publish" => {
                     if let Some(events) = parsed_msg.events {
                         for event_payload in events {
-                           trace!(channel = %parsed_msg.channel, payload = %event_payload, "Publishing event");
-                           state.publish(&parsed_msg.channel, event_payload).await;
+                            trace!(channel = %parsed_msg.channel, payload = %event_payload, "Publishing event");
+                            state.publish(&parsed_msg.channel, event_payload).await;
                         }
                     } else {
                         warn!(id = %parsed_msg.id, "Publish message missing 'events' field.");
                     }
 
                     let ack = json!({"type": "publish_success", "id": parsed_msg.id});
-                    ws_stream.send(Message::text(serde_json::to_string(&ack)?)).await
+                    ws_stream
+                        .send(Message::text(serde_json::to_string(&ack)?))
+                        .await
                         .map_err(|e| ProcessError::Fatal(Box::new(e)))?; // Send error is fatal
                     info!(id = %parsed_msg.id, "Sent publish_success");
                     Ok(())
@@ -409,11 +431,11 @@ async fn process_incoming_message(
                         warn!(sub_id = %sub_id_to_remove, "Received unsubscribe for unknown id");
                     }
                     Ok(())
-                 }
+                }
                 _ => {
                     warn!(type = %parsed_msg.message_type, id = %parsed_msg.id, "Received unknown message type");
                     Ok(())
-                 }
+                }
             }
         }
         Err(e) => {

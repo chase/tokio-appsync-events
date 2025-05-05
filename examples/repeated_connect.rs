@@ -3,11 +3,12 @@
 
 use aws_config::BehaviorVersion;
 use aws_config::SdkConfig;
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
+use std::process;
 use std::time::Duration;
 use tokio::sync::OnceCell;
-use futures_util::StreamExt;
 use tokio::time::sleep;
 
 use tokio_appsync_events::AppSyncEventsClientBuilder;
@@ -33,7 +34,8 @@ async fn get_aws_config() -> &'static SdkConfig {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    const APPSYNC_REALTIME_HOST: &str = "**************************.appsync-realtime-api.us-east-1.amazonaws.com";
+    const APPSYNC_REALTIME_HOST: &str =
+        "**************************.appsync-realtime-api.us-east-1.amazonaws.com";
     const API_KEY: &str = "da2-**************************";
     const CHANNEL: &str = "default/repeater-channel";
     const PUBLISH_INTERVAL_SECS: u64 = 1;
@@ -44,14 +46,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let aws_config = get_aws_config().await;
 
     let mut client = AppSyncEventsClientBuilder::new(APPSYNC_REALTIME_HOST, aws_config)
-        .with_endpoint_url("ws://127.0.0.1:8080") // this allows you to override the default endpoint, for example, to connect to localhost
+        .with_endpoint_url("ws://127.0.0.1:9521") // this allows you to override the default endpoint, for example, to connect to localhost
         .with_api_key_auth(API_KEY)?;
 
     println!("Attempting initial connection...");
     client.connect().await?;
     println!("Initial connection successful.");
 
-    println!("Subscribing to channel '{}' to keep connection alive...", CHANNEL);
+    println!(
+        "Subscribing to channel '{}' to keep connection alive...",
+        CHANNEL
+    );
     let mut subscription = client.subscribe::<PublishData>(CHANNEL).await?;
     println!("Subscription successful (ID: {}).", subscription.id());
 
@@ -62,51 +67,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("Subscription stream ended.");
     });
 
+    let close_client = client.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.unwrap();
+        println!("Received Ctrl+C, shutting down...");
+        println!("Closing client...");
+        let _ = close_client.close().await;
+        process::exit(0);
+    });
+
     let mut sequence_number: u64 = 0;
 
     println!("Publishing to channel: {}", CHANNEL);
-    'publish_loop: loop {
-        tokio::select! {
-            biased;
-            _ = tokio::signal::ctrl_c() => {
-                println!("\nCtrl+C received. Stopping publish loop...");
-                break 'publish_loop;
-            }
+    loop {
+        sleep(Duration::from_secs(PUBLISH_INTERVAL_SECS)).await;
+        sequence_number += 1;
+        let payload = PublishData {
+            sequence: sequence_number,
+            timestamp: chrono::Utc::now().to_rfc3339(),
+        };
 
-            _ = sleep(Duration::from_secs(PUBLISH_INTERVAL_SECS)) => {
-                sequence_number += 1;
-                let payload = PublishData {
-                    sequence: sequence_number,
-                    timestamp: chrono::Utc::now().to_rfc3339(),
-                };
+        println!("Publishing message #{}...", sequence_number);
 
-                println!("Publishing message #{}...", sequence_number);
-
-                tokio::select! {
-                    biased;
-                    _ = tokio::signal::ctrl_c() => {
-                        println!("\nCtrl+C received during publish. Stopping publish loop...");
-                        break 'publish_loop;
-                    }
-
-                    result = client.publish(CHANNEL, &payload) => {
-                        match result {
-                            Ok(_) => {
-                                println!("Publish #{} successful.", sequence_number);
-                            }
-                            Err(e) => {
-                                println!("Publish #{} error: {}. Client will attempt reconnect/retry on next iteration if needed.", sequence_number, e);
-                            }
-                        }
-                    }
-                }
-            }
+        if let Err(e) = client.publish(CHANNEL, &payload).await {
+            println!(
+                "Publish #{} error: {}. Client will attempt reconnect/retry on next iteration if needed.",
+                sequence_number, e
+            );
+        } else {
+            println!("Publish #{} successful.", sequence_number);
         }
     }
-
-    println!("Closing client...");
-    client.close().await?;
-    println!("Client closed.");
-
-    Ok(())
-} 
+}

@@ -310,6 +310,7 @@ impl<'a> AppSyncEventsClientBuilder<'a> {
 }
 
 /// Client for AWS AppSync Real-Time Events
+#[derive(Clone)]
 pub struct AppSyncEventsClient<'a> {
     /// Realtime endpoint
     endpoint_url: String,
@@ -372,10 +373,7 @@ async fn websocket_manager_loop(
             let delay_ms = base_delay_ms.saturating_mul(100);
             let total_delay_ms = delay_ms.saturating_add(rand::random_range(0..JITTER_FACTOR));
 
-            let backoff = std::cmp::min(
-                Duration::from_millis(total_delay_ms),
-                MAX_DELAY,
-            );
+            let backoff = std::cmp::min(Duration::from_millis(total_delay_ms), MAX_DELAY);
 
             tokio::time::sleep(backoff).await;
             reconnect_attempts += 1;
